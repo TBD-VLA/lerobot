@@ -16,9 +16,8 @@ Block Discrete Denoising Diffusion for Vision-Language-Action models using a Qwe
 ## Architecture
 
 - **VLM Backbone**: `Qwen/Qwen3-VL-2B-Instruct` (configurable via `--policy.vlm_checkpoint`)
-- **Action Representation**: Discretized into `n_bins` tokens per dimension
-- **Diffusion**: Block-temporal denoising over action chunks
-- **Inference**: Iterative block denoising with a configurable number of steps
+- **Autoregression**: Autoregressive between temporal action chunks
+- **Diffusion**: Masked diffusion (parallel decoding) within each temporal action chunk
 
 ## Files
 
@@ -39,7 +38,7 @@ Training and evaluation are run separately. Train first, then evaluate checkpoin
 python src/lerobot/scripts/lerobot_train.py \
   --policy.type=tbdvla \
   --output_dir=/$OUTPUT_DIR \
-  --dataset.repo_id=<your-hf-username>/libero_all \
+  --dataset.repo_id=sean1295/libero_all \
   --job_name=tbdvla_experiment \
   --steps=150000 \
   --batch_size=4 \
@@ -66,7 +65,7 @@ accelerate launch --multi_gpu --num_processes=4 \
   --num_workers=4 \
   --policy.type=tbdvla \
   --policy.push_to_hub=false \
-  --dataset.repo_id=<your-hf-username>/libero_all \
+  --dataset.repo_id=sean1295/libero_all \
   --steps=150000 \
   --save_freq=20000 \
   --log_freq=1000 \
@@ -115,28 +114,29 @@ uv run python src/lerobot/scripts/lerobot_eval.py \
 | Parameter | Description | Default |
 |---|---|---|
 | `--policy.vlm_checkpoint` | Qwen3-VL model ID | `Qwen/Qwen3-VL-2B-Instruct` |
+| `--policy.num_vlm_layers` | Number of VLM layers to use (-1 = all) | -1 |
+
+### Diffusion / Block Denoising 
+
+| Parameter | Description | Default |
+|---|---|---|
+| `--policy.block_temporal_size` | Temporal steps per block | 4 |
+| `--policy.n_diffusion_steps` | Number of denoising steps at inference | 2 |
+| `--policy.chunk_size` | Action chunk length (multipliers of block_temporal_size) | 16 |
+
+
+### Training Hyperparameters
+
+| Parameter | Description | Default |
+|---|---|---|
 | `--policy.n_bins` | Number of action discretization bins | 512 |
-| `--policy.chunk_size` | Action chunk length | 16 |
 | `--policy.n_action_steps` | Steps executed per inference (must be <= chunk_size) | 16 |
 | `--policy.n_obs_steps` | Number of observation steps (only 1 supported) | 1 |
 | `--policy.max_task_tokens` | Max task/language tokens fed to the VLM | 64 |
-| `--policy.num_vlm_layers` | Number of VLM layers to use (-1 = all) | -1 |
 | `--policy.use_state` | Include proprioceptive state input | true |
 | `--policy.state_dropout_p` | Dropout probability for state input | 0.0 |
-
-### Diffusion / Block Denoising
-
-| Parameter | Description | Default |
-|---|---|---|
-| `--policy.block_temporal_size` | Temporal steps per block | 1 |
-| `--policy.n_diffusion_steps` | Number of denoising steps at inference | 1 |
-| `--policy.expectation_sample` | Use expectation-based sampling | true |
-| `--policy.latency_timestep` | Blocks to inpaint from previous generation | 0 |
-
-### Training
-
-| Parameter | Description | Default |
-|---|---|---|
+| `--policy.image_resolution` | Resize images to this resolution before cropping (skipped if already that size) | 256,256 |
+| `--policy.crop_shape` | Image crop dimensions (e.g., `224,224`) | None |
 | `--policy.gradient_checkpointing` | Enable gradient checkpointing (saves VRAM) | false |
 | `--policy.precision` | Training precision (`float16`, `bfloat16`, `float32`) | `bfloat16` |
 | `--policy.attn_implementation` | Attention backend (`eager`, `sdpa`, `flex_attention`) | `sdpa` |
@@ -147,15 +147,19 @@ uv run python src/lerobot/scripts/lerobot_eval.py \
 | `--policy.scheduler_warmup_steps` | Warmup steps | 500 |
 | `--policy.grad_clip_norm` | Gradient clipping norm | 1.0 |
 
-### Inference
+### Inference Hyperparameters
 
 | Parameter | Description | Default |
 |---|---|---|
-| `--policy.image_resolution` | Resize images to this resolution before cropping (skipped if already that size) | 256,256 |
-| `--policy.crop_shape` | Image crop dimensions (e.g., `224,224`) | None |
-| `--policy.gripper_dims` | Gripper dimension indices (for sticky grippers) | [-1] |
-| `--policy.compile_model` | Wrap the VLM forward in `torch.compile` (faster inference, one-time compile cost) | true |
+| `--policy.gripper_dims` | Gripper dimension indices (for sticky (binary) grippers. Gripper values become either -1 or 1) | [-1] |
+| `--policy.expectation_sample` | Use expectation-based sampling | true |
+| `--policy.compile_model` | Wrap the VLM forward in `torch.compile` (faster inference, one-time compile cost) | false |
+| `--policy.latency_timestep` | Compensation timestep using Real-Time Chunking | 0 |
 
-## Available VLM Backbones
+## VLM Backbones
 
 Set any Qwen3-VL checkpoint via `--policy.vlm_checkpoint`. The default is `Qwen/Qwen3-VL-2B-Instruct`. Larger Qwen3-VL variants increase capacity at the cost of more VRAM.
+
+## VLA Checkpoints 🤗
+
+### [LIBERO Checkpoint](https://huggingface.co/sean1295/tbdvla_libero)

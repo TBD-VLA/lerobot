@@ -34,7 +34,7 @@ class TBDVLAConfig(PreTrainedConfig):
     vlm_checkpoint: str = "Qwen/Qwen3-VL-2B-Instruct"
     num_vlm_layers: int = -1
     gradient_checkpointing: bool = False
-    compile_model: bool = True
+    compile_model: bool = False
     precision: str = "bfloat16"
     # "eager" (default historical), "sdpa", or "flex_attention". The custom 4D
     # block-diffusion mask is dense, so "flex_attention" wraps it via score_mod
@@ -48,8 +48,8 @@ class TBDVLAConfig(PreTrainedConfig):
     use_prefix_prediction_loss: bool = False
 
     # Inference hyperparameters
-    block_temporal_size: int = 1  # number of temporal steps per block
-    n_diffusion_steps: int = 1
+    block_temporal_size: int = 4  # number of temporal steps per block
+    n_diffusion_steps: int = 2
     expectation_sample: bool = True
     gripper_dims: tuple | None = (-1,) # specicy when using sticky grippers
     latency_timestep: int = 0  # number of blocks to inpaint from previous generation
