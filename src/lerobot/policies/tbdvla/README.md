@@ -7,6 +7,7 @@ uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e ".[libero]"
 uv pip install -U transformers
+uv pip install -U accelerate
 ```
 
 # TBD-VLA Policy
@@ -94,7 +95,7 @@ uv run python src/lerobot/scripts/lerobot_eval.py \
   --eval.batch_size=1 \
   --eval.use_async_envs=false \
   --policy.device=cuda \
-  --policy.n_action_steps=8 \
+  --policy.n_action_steps=12 \
   --policy.n_diffusion_steps=2  
 ```
 
@@ -130,7 +131,6 @@ uv run python src/lerobot/scripts/lerobot_eval.py \
 | Parameter | Description | Default |
 |---|---|---|
 | `--policy.n_bins` | Number of action discretization bins | 512 |
-| `--policy.n_action_steps` | Steps executed per inference (must be <= chunk_size) | 16 |
 | `--policy.n_obs_steps` | Number of observation steps (only 1 supported) | 1 |
 | `--policy.max_task_tokens` | Max task/language tokens fed to the VLM | 64 |
 | `--policy.use_state` | Include proprioceptive state input | true |
@@ -151,6 +151,7 @@ uv run python src/lerobot/scripts/lerobot_eval.py \
 
 | Parameter | Description | Default |
 |---|---|---|
+| `--policy.n_action_steps` | Steps executed per inference (must be <= chunk_size) | 12 |
 | `--policy.gripper_dims` | Gripper dimension indices (for sticky (binary) grippers. Gripper values become either -1 or 1) | [-1] |
 | `--policy.expectation_sample` | Use expectation-based sampling | true |
 | `--policy.compile_model` | Wrap the VLM forward in `torch.compile` (faster inference, one-time compile cost) | false |

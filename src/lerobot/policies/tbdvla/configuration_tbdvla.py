@@ -52,7 +52,7 @@ class TBDVLAConfig(PreTrainedConfig):
     n_diffusion_steps: int = 2
     expectation_sample: bool = True
     gripper_dims: tuple | None = (-1,) # specicy when using sticky grippers
-    latency_timestep: int = 0  # number of blocks to inpaint from previous generation
+    latency_timestep: int = 0  # number of timesteps to inpaint (freeze) from the previous chunk's tail
 
     # Image parameters. Incoming images are resized to `image_resolution`
     # (skipped if already at that size) and then cropped to `crop_shape`.
@@ -74,6 +74,18 @@ class TBDVLAConfig(PreTrainedConfig):
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
+            )
+        if self.latency_timestep >= self.n_action_steps:
+            # The chunk is laid out as [0, latency_timestep) frozen in-painting prefix
+            # followed by freshly generated actions. `predict_action_chunk` executes the
+            # first `n_action_steps` timesteps, so if `latency_timestep >= n_action_steps`
+            # every executed action is a frozen copy of the previous chunk's tail and the
+            # newly generated actions are never executed. The RTC latency window `d` must
+            # stay below the rollout horizon `H_a` (matches the website animation's clamp).
+            raise ValueError(
+                f"`latency_timestep` ({self.latency_timestep}) must be < `n_action_steps` "
+                f"({self.n_action_steps}); otherwise no freshly generated actions are ever "
+                "executed (the executed slice falls entirely inside the frozen in-painting prefix)."
             )
 
     def validate_features(self) -> None:
