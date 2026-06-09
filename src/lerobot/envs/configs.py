@@ -512,12 +512,12 @@ class RoboCasaEnv(EnvConfig):
     visualization_height: int = 512
     visualization_width: int = 512
     split: str | None = None
-    # Object-mesh registries to sample from. Upstream default is
-    # ("objaverse", "lightwheel"), but objaverse is ~30GB and the CI image
-    # only ships the lightwheel pack. Override to include objaverse once
-    # you've run `python -m robocasa.scripts.download_kitchen_assets
-    # --type objaverse` locally.
-    obj_registries: list[str] = field(default_factory=lambda: ["lightwheel"])
+    # Object-mesh registries to sample from. Matches RoboCasa's upstream default
+    # (objaverse first, then lightwheel). objaverse provides the generic object
+    # categories (mug, vegetables, ...) that most atomic tasks sample; lightwheel
+    # alone leaves valid_categories empty for tasks like CoffeeSetupMug. Both
+    # packs must be downloaded locally (objaverse ~2.1GB, lightwheel ~756MB).
+    obj_registries: list[str] = field(default_factory=lambda: ["objaverse", "lightwheel"])
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(12,))}
     )

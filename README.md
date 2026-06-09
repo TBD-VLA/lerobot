@@ -25,153 +25,137 @@
 
 🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
 
-## Quick Start
+# TBD-VLA
+[![Project Website](https://img.shields.io/badge/Project-Website-2ea44f?style=for-the-badge)](https://tbd-vla.github.io/)
+[![arXiv](https://img.shields.io/badge/arXiv-2606.07895-df2a2a.svg?style=for-the-badge)](https://arxiv.org/abs/2606.07895)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.11.0-EE4C2C.svg?style=for-the-badge&logo=pytorch)](https://pytorch.org/get-started/locally/)
+[![Python](https://img.shields.io/badge/python-3.12-blue?style=for-the-badge)](https://www.python.org)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=for-the-badge)](LICENSE)
 
-LeRobot can be installed directly from PyPI.
+
+This is LeRobot implementation for Block Discrete Denoising Diffusion for Vision-Language-Action models using a Qwen3-VL VLM backbone.
+
+# Installation
+```
+git clone https://github.com/TBD-VLA/lerobot.git
+cd lerobot
+uv python install 3.12
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[libero]"
+uv pip install -U transformers
+uv pip install -U accelerate
+```
+## Training
+
+Training and evaluation are run separately. Train first, then evaluate checkpoints.
+
+### Single GPU
 
 ```bash
-pip install lerobot
-lerobot-info
+python src/lerobot/scripts/lerobot_train.py \
+  --policy.type=tbdvla \
+  --output_dir=/$OUTPUT_DIR \
+  --dataset.repo_id=sean1295/libero_all \
+  --job_name=tbdvla_experiment \
+  --steps=150000 \
+  --batch_size=4 \
+  --save_freq=20000 \
+  --log_freq=1000 \
+  --policy.device=cuda \
+  --policy.n_bins=512 \
+  --policy.block_temporal_size=4 \
+  --policy.n_diffusion_steps=2 \
+  --policy.gripper_dims=[-1] \
+  --policy.chunk_size=16 \
+  --policy.n_action_steps=16 \
+  --policy.gradient_checkpointing=true \
+  --policy.push_to_hub=false \
+  --wandb.enable=false
 ```
 
-> [!IMPORTANT]
-> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+## Evaluation
 
-## Robots & Control
+Evaluate a saved checkpoint against the LIBERO environment after training is complete.
 
-<div align="center">
-  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
-</div>
-
-LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
-
-```python
-from lerobot.robots.myrobot import MyRobot
-
-# Connect to a robot
-robot = MyRobot(config=...)
-robot.connect()
-
-# Read observation and send action
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
-```
-
-**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1.
-
-While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
-
-For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
-
-## LeRobot Dataset
-
-To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
-
-- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
-- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
-
-```python
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# Load a dataset from the Hub
-dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
-
-# Access data (automatically handles video decoding)
-episode_index=0
-print(f"{dataset[episode_index]['action'].shape=}\n")
-```
-
-Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)
-
-## SoTA Models
-
-LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, and Vision-Language-Action (VLA) models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
-
-<p align="center">
-  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
-</p>
-
-Training a policy is as simple as running a script configuration:
+### Evaluate specific checkpoints
 
 ```bash
-lerobot-train \
-  --policy=act \
-  --dataset.repo_id=lerobot/aloha_mobile_cabinet
-```
-
-| Category                   | Models                                                                                                                                                                                                                  |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md) |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                             |
-| **VLAs Models**            | [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.5](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx)            |
-
-Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub
-
-For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies). For GPU/RAM requirements and expected training time per policy, see the [Compute Hardware Guide](https://huggingface.co/docs/lerobot/hardware_guide).
-
-## Inference & Evaluation
-
-Evaluate your policies in simulation or on real hardware using the unified evaluation script. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come.
-
-```bash
-# Evaluate a policy on the LIBERO benchmark
-lerobot-eval \
-  --policy.path=lerobot/pi0_libero_finetuned \
+uv run python src/lerobot/scripts/lerobot_eval.py \
+  --policy.path=$CKPT_DIR \
   --env.type=libero \
-  --env.task=libero_object \
-  --eval.n_episodes=10
+  --env.task=libero_10 \
+  --eval.n_episodes=50 \
+  --eval.batch_size=1 \
+  --eval.use_async_envs=false \
+  --policy.device=cuda \
+  --policy.n_action_steps=12 \
+  --policy.n_diffusion_steps=2  
 ```
 
-Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub)
+### VLA Checkpoints 🤗
 
-## Resources
+#### [sean1295/tbdvla_libero](https://huggingface.co/sean1295/tbdvla_libero)
 
-- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
-- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
-- **[Discord](https://discord.gg/q8Dzzpym3f):** Join the `LeRobot` server to discuss with the community.
-- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
-- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
+## TBD-VLA Parameters
 
-## Citation
+### Model Architecture
 
-If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
+| Parameter | Description | Default |
+|---|---|---|
+| `--policy.vlm_checkpoint` | Qwen3-VL model ID | `Qwen/Qwen3-VL-2B-Instruct` |
+| `--policy.num_vlm_layers` | Number of VLM layers to use (-1 = all) | -1 |
 
+### Diffusion / Block Denoising 
+
+| Parameter | Description | Default |
+|---|---|---|
+| `--policy.block_temporal_size` | Temporal steps per block | 4 |
+| `--policy.n_diffusion_steps` | Number of denoising steps at inference | 2 |
+| `--policy.chunk_size` | Action chunk length (multipliers of block_temporal_size) | 16 |
+
+
+### Training Hyperparameters
+
+| Parameter | Description | Default |
+|---|---|---|
+| `--policy.n_bins` | Number of action discretization bins | 512 |
+| `--policy.n_obs_steps` | Number of observation steps (only 1 supported) | 1 |
+| `--policy.max_task_tokens` | Max task/language tokens fed to the VLM | 64 |
+| `--policy.use_state` | Include proprioceptive state input | true |
+| `--policy.state_dropout_p` | Dropout probability for state input | 0.0 |
+| `--policy.image_resolution` | Resize images to this resolution before cropping (skipped if already that size) | 256,256 |
+| `--policy.crop_shape` | Image crop dimensions (e.g., `224,224`) | None |
+| `--policy.gradient_checkpointing` | Enable gradient checkpointing (saves VRAM) | false |
+| `--policy.precision` | Training precision (`float16`, `bfloat16`, `float32`) | `bfloat16` |
+| `--policy.attn_implementation` | Attention backend (`eager`, `sdpa`, `flex_attention`) | `sdpa` |
+| `--policy.optimizer_lr` | AdamW learning rate (applied to all parameters) | 1e-4 |
+| `--policy.optimizer_betas` | Adam betas | (0.95, 0.999) |
+| `--policy.optimizer_weight_decay` | Weight decay | 0.01 |
+| `--policy.scheduler_name` | LR scheduler type | `cosine` |
+| `--policy.scheduler_warmup_steps` | Warmup steps | 500 |
+| `--policy.grad_clip_norm` | Gradient clipping norm | 1.0 |
+
+### Inference Hyperparameters
+
+| Parameter | Description | Default |
+|---|---|---|
+| `--policy.n_action_steps` | Steps executed per inference (must be <= chunk_size) | 12 |
+| `--policy.gripper_dims` | Gripper dimension indices (for sticky (binary) grippers. Gripper values become either -1 or 1) | [-1] |
+| `--policy.expectation_sample` | Use expectation-based sampling | true |
+| `--policy.compile_model` | Wrap the VLM forward in `torch.compile` (faster inference, one-time compile cost) | false |
+| `--policy.latency_timestep` | Compensation timestep using Real-Time Chunking | 0 |
+
+## VLM Backbones
+
+Set any Qwen3-VL checkpoint via `--policy.vlm_checkpoint`. The default is `Qwen/Qwen3-VL-2B-Instruct`. Larger Qwen3-VL variants increase capacity at the cost of more VRAM.
+
+## BibTex
 ```bibtex
-@misc{cadene2024lerobot,
-    author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and Gallouedec, Quentin and Zouitine, Adil and Palma, Steven and Kooijmans, Pepijn and Aractingi, Michel and Shukor, Mustafa and Aubakirova, Dana and Russi, Martino and Capuano, Francesco and Pascal, Caroline and Choghari, Jade and Moss, Jess and Wolf, Thomas},
-    title = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
-    howpublished = "\url{https://github.com/huggingface/lerobot}",
-    year = {2024}
+@article{lee2026tbdvlatemporalblockdiffusion,
+      title={TBD-VLA: Temporal Block Diffusion Vision Language Action Model},
+      author={Lee, Sung-Wook and Kang, Xuhui and Kuo, Yen-Ling},
+      journal={arXiv preprint},
+      year={2026},
 }
 ```
-
-If you are referencing our research or the academic paper, please also cite our ICLR publication:
-
-<details>
-<summary><b>ICLR 2026 Paper</b></summary>
-
-```bibtex
-@inproceedings{cadenelerobot,
-  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
-  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
-  booktitle={The Fourteenth International Conference on Learning Representations},
-  year={2026},
-  url={https://arxiv.org/abs/2602.22818}
-}
-```
-
-</details>
-
-## Contribute
-
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
-
-<p align="center">
-  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
-</p>
-
-<div align="center">
-<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
-</div>

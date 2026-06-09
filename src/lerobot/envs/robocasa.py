@@ -47,15 +47,14 @@ DEFAULT_CAMERAS = [
     "robot0_agentview_right",
 ]
 
-# Object-mesh registries to sample from. RoboCasa's upstream default is
-# ("objaverse", "lightwheel"), but the objaverse pack is huge (~30GB) and
-# most users — including our CI image — only download the lightwheel pack
-# (`--type objs_lw` in `download_kitchen_assets`). When a sampled object
-# category has zero candidates in every registry, robocasa crashes with
-# `ValueError: Probabilities contain NaN` (0/0 divide in the probability
-# normalization). Restricting to registries that are actually on disk
-# avoids the NaN and matches what the asset download provides.
-DEFAULT_OBJ_REGISTRIES: tuple[str, ...] = ("lightwheel",)
+# Object-mesh registries to sample from. Matches RoboCasa's upstream default
+# (objaverse first, then lightwheel). objaverse provides the generic object
+# categories (mug, vegetables, cans, ...) that most atomic tasks sample; many
+# tasks (e.g. CoffeeSetupMug) have no lightwheel-registered candidates, so a
+# lightwheel-only registry leaves valid_categories empty and crashes in
+# sample_kitchen_object_helper. Both packs must be downloaded on disk
+# (`download_kitchen_assets --type objs_objaverse objs_lw`).
+DEFAULT_OBJ_REGISTRIES: tuple[str, ...] = ("objaverse", "lightwheel")
 
 # Task-group shortcuts accepted as `--env.task`. When the user passes one of
 # these names, we expand it to the upstream RoboCasa task list and auto-set

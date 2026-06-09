@@ -1,3 +1,17 @@
+# TBD-VLA
+
+[**Project Website**](https://tbd-vla.github.io/)
+
+This is LeRobot implementation for Block Discrete Denoising Diffusion for Vision-Language-Action models using a Qwen3-VL VLM backbone.
+
+[![Project Website](https://img.shields.io/badge/Project-Website-2ea44f?style=for-the-badge)](https://tbd-vla.github.io/)
+[![arXiv](https://img.shields.io/badge/arXiv-2606.07895-df2a2a.svg?style=for-the-badge)](https://arxiv.org/abs/2606.07895)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.11.0-EE4C2C.svg?style=for-the-badge&logo=pytorch)](https://pytorch.org/get-started/locally/)
+[![Python](https://img.shields.io/badge/python-3.12-blue?style=for-the-badge)](https://www.python.org)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=for-the-badge)](LICENSE)
+
+
+
 # Installation
 ```
 git clone https://github.com/TBD-VLA/lerobot.git
@@ -9,26 +23,6 @@ uv pip install -e ".[libero]"
 uv pip install -U transformers
 uv pip install -U accelerate
 ```
-
-# TBD-VLA Policy
-
-Block Discrete Denoising Diffusion for Vision-Language-Action models using a Qwen3-VL VLM backbone.
-
-## Architecture
-
-- **VLM Backbone**: `Qwen/Qwen3-VL-2B-Instruct` (configurable via `--policy.vlm_checkpoint`)
-- **Autoregression**: Autoregressive between temporal action chunks
-- **Diffusion**: Masked diffusion (parallel decoding) within each temporal action chunk
-
-## Files
-
-| File | Description |
-|---|---|
-| `configuration_tbdvla.py` | `TBDVLAConfig` dataclass with all hyperparameters |
-| `modeling_tbdvla.py` | `TBDVLAPolicy` — model, training loss, and inference |
-| `processor_tbdvla.py` | Pre/post-processing pipelines (normalization, device transfer) |
-| `__init__.py` | Exports `TBDVLAConfig`, `TBDVLAPolicy`, `make_tbdvla_pre_post_processors` |
-
 ## Training
 
 Training and evaluation are run separately. Train first, then evaluate checkpoints.
@@ -40,7 +34,7 @@ python src/lerobot/scripts/lerobot_train.py \
   --policy.type=tbdvla \
   --output_dir=/$OUTPUT_DIR \
   --dataset.repo_id=sean1295/libero_all \
-  --job_name=tbdvla_experiment \
+  --job_name=tbdvla_libero \
   --steps=150000 \
   --batch_size=4 \
   --save_freq=20000 \
@@ -56,6 +50,7 @@ python src/lerobot/scripts/lerobot_train.py \
   --policy.push_to_hub=false \
   --wandb.enable=false
 ```
+
 
 ### Multi-GPU (4 GPUs)
 
@@ -84,7 +79,7 @@ accelerate launch --multi_gpu --num_processes=4 \
 
 Evaluate a saved checkpoint against the LIBERO environment after training is complete.
 
-### Evaluate a specific checkpoint
+### Evaluate specific checkpoints
 
 ```bash
 uv run python src/lerobot/scripts/lerobot_eval.py \
@@ -99,14 +94,9 @@ uv run python src/lerobot/scripts/lerobot_eval.py \
   --policy.n_diffusion_steps=2  
 ```
 
-### LIBERO task variants
+### VLA Checkpoints 🤗
 
-| `--env.task` | Description |
-|---|---|
-| `libero_10` | Long horizon tasks |
-| `libero_spatial` | Spatial reasoning tasks |
-| `libero_object` | Object manipulation tasks |
-| `libero_goal` | Goal varying tasks |
+#### [sean1295/tbdvla_libero](https://huggingface.co/sean1295/tbdvla_libero)
 
 ## TBD-VLA Parameters
 
@@ -161,6 +151,12 @@ uv run python src/lerobot/scripts/lerobot_eval.py \
 
 Set any Qwen3-VL checkpoint via `--policy.vlm_checkpoint`. The default is `Qwen/Qwen3-VL-2B-Instruct`. Larger Qwen3-VL variants increase capacity at the cost of more VRAM.
 
-## VLA Checkpoints 🤗
-
-### [LIBERO Checkpoint](https://huggingface.co/sean1295/tbdvla_libero)
+## BibTex
+```bibtex
+@article{lee2026tbdvlatemporalblockdiffusion,
+      title={TBD-VLA: Temporal Block Diffusion Vision Language Action Model},
+      author={Lee, Sung-Wook and Kang, Xuhui and Kuo, Yen-Ling},
+      journal={arXiv preprint},
+      year={2026},
+}
+```
