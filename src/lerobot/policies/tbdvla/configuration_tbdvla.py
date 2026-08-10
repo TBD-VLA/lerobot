@@ -46,6 +46,8 @@ class TBDVLAConfig(PreTrainedConfig):
     state_dropout_p: float = 0.0
     max_task_tokens: int = 64
     use_prefix_prediction_loss: bool = False
+    # Keep the Qwen3-VL vision tower frozen during training (no gradients).
+    freeze_vision_encoder: bool = False
 
     # Inference hyperparameters
     block_temporal_size: int = 4  # number of temporal steps per block

@@ -255,6 +255,10 @@ class Qwen3VLBlockDiffusion(nn.Module):
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
 
+        if getattr(config, "freeze_vision_encoder", False):
+            for p in self.vlm.model.visual.parameters():
+                p.requires_grad = False
+
         # ── Layer truncation ──
         self.num_vlm_layers = getattr(config, "num_vlm_layers", -1)
         if self.num_vlm_layers > 0:
