@@ -255,6 +255,10 @@ class Qwen3VLBlockDiffusion(nn.Module):
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
 
+        if getattr(config, "freeze_vision_encoder", False):
+            for p in self.vlm.model.visual.parameters():
+                p.requires_grad = False
+
         # ── Layer truncation ──
         self.num_vlm_layers = getattr(config, "num_vlm_layers", -1)
         if self.num_vlm_layers > 0:
@@ -1274,7 +1278,7 @@ class Qwen3VLBlockDiffusion(nn.Module):
         anchor_row_start = max_extra
         anchor_row_end = max_extra + blk_sz
         anchor_col_start = kv_len + max_extra
-        # anchor_col_end = kv_len + max_extra + blk_sz
+        anchor_col_end = kv_len + max_extra + blk_sz
 
         def _block_row(i):
             start = max_extra + blk_sz + i * blk_sz
@@ -1284,8 +1288,8 @@ class Qwen3VLBlockDiffusion(nn.Module):
             start = kv_len + max_extra + blk_sz + i * blk_sz
             return start, start + blk_sz
 
-        # noisy_row_start = max_extra + blk_sz + n_decoded * blk_sz
-        # noisy_row_end = combined_len
+        noisy_row_start = max_extra + blk_sz + n_decoded * blk_sz
+        noisy_row_end = combined_len
         noisy_col_start = kv_len + max_extra + blk_sz + n_decoded * blk_sz
         noisy_col_end = kv_len + combined_len
 
@@ -1307,26 +1311,34 @@ class Qwen3VLBlockDiffusion(nn.Module):
             # ── Anchor: sees KV cache + extra prefix, bidirectional within itself ──
             # Already 0.0 for KV cache and extra prefix
             # Already 0.0 within anchor (anchor_col_start..anchor_col_end)
-            # Block anchor from seeing decoded blocks and noisy (except noisy block 0)
+            #
+            # Training gives the anchor exactly one edge into the action region:
+            # anchor → noisy block 0. Once block 0 has been decoded its token
+            # group at those RoPE positions is `decoded_0` — a mask-ratio-0
+            # sample from the same corruption distribution — so that is where the
+            # edge has to point. The block currently being decoded is block
+            # n_decoded, not block 0, so for n_decoded > 0 the anchor must NOT
+            # see it: every decoded block attends to the anchor, so contaminating
+            # it does reach the predictor.
+            for i in range(n_decoded):
+                if i == 0:
+                    continue  # anchor → decoded_0 stands in for anchor → noisy_0
+                cs, ce = _block_col(i)
+                attn[s, 0, anchor_row_start:anchor_row_end, cs:ce] = float("-inf")
             if n_decoded > 0:
-                # Anchor blocks decoded blocks
-                for i in range(n_decoded):
-                    cs, ce = _block_col(i)
-                    attn[s, 0, anchor_row_start:anchor_row_end, cs:ce] = float("-inf")
-            # Anchor always sees the noisy block (already 0.0). Its prediction
-            # is only read when n_decoded==0, where the noisy block is block 0;
-            # for n_decoded>0 the output comes from the last decoded block, so
-            # this attention edge is harmless.
+                attn[s, 0, anchor_row_start:anchor_row_end, noisy_col_start:noisy_col_end] = float("-inf")
 
-            # ── Decoded blocks ──
+            # ── Decoded blocks (they play the role of training's clean blocks) ──
             for i in range(n_decoded):
                 rs, re = _block_row(i)
 
                 # Sees KV cache + extra prefix + anchor (already 0.0)
                 # Bidirectional within itself (already 0.0)
 
-                # Block future decoded blocks
-                for j in range(i + 1, n_decoded):
+                # Training: clean block i attends to clean blocks 0..i AND to
+                # noisy block i+1. At inference block i+1's token group is
+                # `decoded_{i+1}`, so leave that one open and block i+2 onwards.
+                for j in range(i + 2, n_decoded):
                     cs, ce = _block_col(j)
                     attn[s, 0, rs:re, cs:ce] = float("-inf")
 
@@ -1336,10 +1348,13 @@ class Qwen3VLBlockDiffusion(nn.Module):
                     attn[s, 0, rs:re, noisy_col_start:noisy_col_end] = float("-inf")
 
             # ── Noisy block ──
-            # Sees KV cache + extra prefix + anchor (already 0.0)
+            # Sees KV cache + extra prefix (already 0.0)
             # Sees prior decoded blocks (already 0.0)
             # Bidirectional within itself (already 0.0)
-            # That's all correct by default (everything is 0.0 = allowed)
+            # Training does NOT give noisy blocks an edge to the anchor
+            # (`_make_block_diffusion_training_mask` has no `is_noi_i & is_sen_j`
+            # term), so cut it here too.
+            attn[s, 0, noisy_row_start:noisy_row_end, anchor_col_start:anchor_col_end] = float("-inf")
 
         try:
             outputs = self.vlm.forward(
