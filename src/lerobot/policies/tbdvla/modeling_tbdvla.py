@@ -346,6 +346,11 @@ class Qwen3VLBlockDiffusion(nn.Module):
 
         self._init_special_embeddings()
 
+        # Inference-time caches of things that depend only on the prompt layout
+        # (see _build_prompt / _build_inputs / _get_position_ids_from_inputs).
+        self._prompt_cache: dict[tuple, str] = {}
+        self._layout_cache: dict[tuple, dict] = {}
+
     def _init_special_embeddings(self):
         print("Vocab is initialized!")
         embed = self.vlm.get_input_embeddings().weight
@@ -449,7 +454,14 @@ class Qwen3VLBlockDiffusion(nn.Module):
         """
         Get 3D M-RoPE position IDs from model inputs.
         Returns: (3, batch_size, seq_len) tensor.
+
+        At inference the positions depend only on the prompt layout (token types,
+        padding, image grids), so they are computed once per layout and reused.
         """
+        layout = model_inputs.get("layout")
+        if layout is not None and "position_ids" in layout:
+            return layout["position_ids"].clone()
+
         input_ids = model_inputs["input_ids"]
         device = input_ids.device
         seq_len = input_ids.shape[1]
@@ -473,11 +485,55 @@ class Qwen3VLBlockDiffusion(nn.Module):
         else:
             position_ids = self._build_text_position_ids(seq_len, batch_size, device)
 
+        if layout is not None:
+            layout["position_ids"] = position_ids.clone()
         return position_ids
 
     # ──────────────────────────────────────────────────────────────────────────
     # _build_inputs — task slot approach, no decode round-trip
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _build_prompt(self, lang_text: str, state_dim: int, n_images: int, n_slots: int) -> str:
+        """Chat-formatted prompt of one sample. A pure function of its arguments, so it is cached."""
+        key = (lang_text, state_dim, n_images, n_slots)
+        prompt = self._prompt_cache.get(key)
+        if prompt is not None:
+            return prompt
+
+        task_cleaned = lang_text.lower().strip().replace("_", " ")
+        task_token_ids = self.processor.tokenizer.encode(
+            task_cleaned, add_special_tokens=False,
+        )
+
+        # Truncate if a cap is configured.
+        max_task_tokens = self.config.max_task_tokens
+        if max_task_tokens is not None and len(task_token_ids) > max_task_tokens:
+            task_token_ids = task_token_ids[:max_task_tokens]
+            task_cleaned = self.processor.tokenizer.decode(
+                task_token_ids, skip_special_tokens=True,
+            )
+
+        state_str = self.state_slot_token_str * state_dim
+        if self.config.use_state:
+            prefix = f"State: {state_str}, Task: {task_cleaned}, Actions: "
+        else:
+            prefix = f"Task: {task_cleaned}, Actions: "
+
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "image"} for _ in range(n_images)] + [{"type": "text", "text": prefix}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": self.slot_token_str * n_slots}],
+            },
+        ]
+        prompt = self.processor.apply_chat_template(
+            messages, add_generation_prompt=False,
+        )
+        self._prompt_cache[key] = prompt
+        return prompt
 
     def _build_inputs(
         self,
@@ -495,46 +551,9 @@ class Qwen3VLBlockDiffusion(nn.Module):
         if n_slots is None:
             n_slots = self.n_action_tokens
 
-        slot_str = self.slot_token_str * n_slots
-        state_str = self.state_slot_token_str * states.shape[-1]
-        image_content = [{"type": "image"} for _ in range(len(images))]
-
-        max_task_tokens = self.config.max_task_tokens
-
-        prompts = []
-        for idx in range(batch_size):
-            task_cleaned = lang_text[idx].lower().strip().replace("_", " ")
-
-            task_token_ids = self.processor.tokenizer.encode(
-                task_cleaned, add_special_tokens=False,
-            )
-
-            # Truncate if a cap is configured.
-            if max_task_tokens is not None and len(task_token_ids) > max_task_tokens:
-                task_token_ids = task_token_ids[:max_task_tokens]
-                task_cleaned = self.processor.tokenizer.decode(
-                    task_token_ids, skip_special_tokens=True,
-                )
-
-            if self.config.use_state:
-                prefix = f"State: {state_str}, Task: {task_cleaned}, Actions: "
-            else:
-                prefix = f"Task: {task_cleaned}, Actions: "
-
-            messages = [
-                {
-                    "role": "user",
-                    "content": image_content + [{"type": "text", "text": prefix}],
-                },
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": slot_str}],
-                },
-            ]
-            prompt = self.processor.apply_chat_template(
-                messages, add_generation_prompt=False,
-            )
-            prompts.append(prompt)
+        prompts = [
+            self._build_prompt(text, states.shape[-1], len(images), n_slots) for text in lang_text
+        ]
 
         # ── Prepare images ──
         # Resize (skipped when already at the target size) and crop are applied
@@ -553,31 +572,56 @@ class Qwen3VLBlockDiffusion(nn.Module):
             list(views) for views in zip(*(p.unbind(0) for p in processed), strict=True)
         ]
 
-        model_inputs = self.processor(
-            images=images_reshaped,
-            text=prompts,
-            do_rescale=False,
-            do_resize=True,
-            padding=True,
-            return_tensors="pt",
-        )
+        # The text side of the processor output (token ids, padding, slot and
+        # state positions) depends only on the prompts and image sizes, never on
+        # the state or pixel values. At inference it is built once per layout and
+        # reused, so each step runs only the image processor and locates the
+        # slots without device-to-host syncs.
+        layout_key = (tuple(prompts), tuple(tuple(p.shape[-2:]) for p in processed))
+        layout = None if self.training else self._layout_cache.get(layout_key)
+        if layout is None:
+            proc_out = self.processor(
+                images=images_reshaped,
+                text=prompts,
+                do_rescale=False,
+                do_resize=True,
+                padding=True,
+                return_tensors="pt",
+            )
+            text_inputs = {k: v for k, v in proc_out.items() if k not in ("pixel_values", "image_grid_thw")}
+            image_inputs = {k: v for k, v in proc_out.items() if k in ("pixel_values", "image_grid_thw")}
 
-        model_inputs = {
-            k: (v.to(device) if isinstance(v, Tensor) else v)
-            for k, v in model_inputs.items()
-        }
+            # ── Locate action / state slots (on the CPU token ids) ──
+            input_ids = text_inputs["input_ids"]
+            slot_mask = input_ids == self.slot_token_id
+            slot_counts = slot_mask.sum(dim=1)
+            assert (slot_counts == n_slots).all(), (
+                f"Expected {n_slots} ACT_SLOT tokens, got {slot_counts.tolist()}"
+            )
+            layout = {
+                "text": {k: (v.to(device) if isinstance(v, Tensor) else v) for k, v in text_inputs.items()},
+                "slot_positions": slot_mask.nonzero()[:, 1].reshape(batch_size, n_slots).to(device),
+                "state_positions": (
+                    (input_ids == self.state_slot_token_id).nonzero()[:, 1].reshape(batch_size, -1).to(device)
+                    if self.config.use_state else None
+                ),
+            }
+            if not self.training:
+                self._layout_cache[layout_key] = layout
+        else:
+            image_inputs = self.processor.image_processor(
+                images=images_reshaped, do_rescale=False, do_resize=True, return_tensors="pt",
+            )
+
+        model_inputs = dict(layout["text"])
+        model_inputs.update({k: v.to(device) for k, v in image_inputs.items()})
         if "pixel_values" in model_inputs:
             model_inputs["pixel_values"] = model_inputs["pixel_values"].to(self.precision)
+        if not self.training:
+            model_inputs["layout"] = layout
 
-        input_ids = model_inputs["input_ids"]
-
-        # ── Locate and fill action slots ──
-        slot_mask = input_ids == self.slot_token_id
-        slot_counts = slot_mask.sum(dim=1)
-        assert (slot_counts == n_slots).all(), (
-            f"Expected {n_slots} ACT_SLOT tokens, got {slot_counts.tolist()}"
-        )
-        slot_positions = slot_mask.nonzero()[:, 1].reshape(batch_size, n_slots)
+        input_ids = model_inputs["input_ids"].clone()  # cached tensor: fill a copy
+        slot_positions = layout["slot_positions"]
 
         if action_ids is None:
             fill = torch.full(
@@ -609,11 +653,7 @@ class Qwen3VLBlockDiffusion(nn.Module):
                     disc_states,
                 )
 
-            state_mask = input_ids == self.state_slot_token_id
-            state_positions = state_mask.nonzero()[:, 1].reshape(
-                batch_size, states.shape[-1]
-            )
-            input_ids.scatter_(1, state_positions, disc_states)
+            input_ids.scatter_(1, layout["state_positions"], disc_states)
 
         model_inputs["input_ids"] = input_ids
         return model_inputs, slot_positions
@@ -972,10 +1012,16 @@ class Qwen3VLBlockDiffusion(nn.Module):
         fixed_prefix: Tensor | None = None,
         n_fixed: int = 0,
     ) -> Tensor:
-        """Run masked diffusion unmasking for a single block."""
+        """Run masked diffusion unmasking for a single block.
+
+        Written without device-to-host syncs (no boolean indexing, no `.any()`
+        on device tensors), so the next model call is queued while the GPU is
+        still busy with the previous one.
+        """
         blk_sz = self.block_size
-        n_free = blk_sz - n_fixed
-        n_steps = min(n_steps, n_free)
+        n_steps = min(n_steps, blk_sz - n_fixed)
+        n_bins = self.config.n_bins
+        lo = self.action_bin_start
 
         current_ids = torch.full(
             (batch_size, blk_sz),
@@ -983,98 +1029,52 @@ class Qwen3VLBlockDiffusion(nn.Module):
             dtype=torch.long,
             device=device,
         )
-
         if n_fixed > 0 and fixed_prefix is not None:
             current_ids[:, :n_fixed] = fixed_prefix
 
-        action_slice = slice(
-            self.action_bin_start,
-            self.action_bin_start + self.config.n_bins,
-        )
+        is_free = torch.ones(blk_sz, dtype=torch.bool, device=device)
+        is_free[:n_fixed] = False
+        bin_indices = torch.arange(n_bins, device=device)
+        pos_in_sort = torch.arange(blk_sz, device=device).unsqueeze(0)
+        gripper_cols = None
+        if self.config.expectation_sample and self.config.gripper_dims:
+            dims = torch.arange(blk_sz, device=device) % self.action_dim
+            gripper_cols = torch.zeros(blk_sz, dtype=torch.bool, device=device)
+            for d in self.config.gripper_dims:
+                gripper_cols |= dims == d % self.action_dim
 
         for step in range(n_steps, 0, -1):
-            is_free = torch.ones(blk_sz, dtype=torch.bool, device=device)
-            if n_fixed > 0:
-                is_free[:n_fixed] = False
-
-            still_masked = (current_ids == self.mask_token_id) & is_free[None, :]
-            if not still_masked.any():
-                break
+            still_masked = (current_ids == self.mask_token_id) & is_free
 
             logits = block_logits_fn(current_ids)
-            action_logits = logits[..., action_slice]
-
-            action_probs = action_logits.softmax(dim=-1)
+            action_probs = logits[..., lo:lo + n_bins].softmax(dim=-1)
             if self.config.expectation_sample:
-                bin_indices = torch.arange(
-                    self.config.n_bins, device=device, dtype=action_probs.dtype
-                )
-                expected_idx = (action_probs * bin_indices).sum(dim=-1)
-                candidates = expected_idx.round().long().clamp(
-                    0, self.config.n_bins - 1
-                ) + self.action_bin_start
-
-                if self.config.gripper_dims:
-                    argmax_candidates = action_probs.argmax(dim=-1) + self.action_bin_start
-                    for d in self.config.gripper_dims:
-                        dim_idx = d % self.action_dim
-                        dim_mask = torch.arange(blk_sz, device=device) % self.action_dim == dim_idx
-                        candidates[:, dim_mask] = argmax_candidates[:, dim_mask]
+                expected_idx = (action_probs * bin_indices.to(action_probs.dtype)).sum(dim=-1)
+                candidates = expected_idx.round().long().clamp(0, n_bins - 1) + lo
+                if gripper_cols is not None:
+                    candidates = torch.where(gripper_cols, action_probs.argmax(dim=-1) + lo, candidates)
             else:
-                candidates = action_probs.argmax(dim=-1) + self.action_bin_start
-            confidence = self._unmask_confidence(action_probs, device)
+                candidates = action_probs.argmax(dim=-1) + lo
+            confidence = self._unmask_confidence(action_probs, device).masked_fill(~still_masked, float("-inf"))
 
-            new_ids = current_ids.clone()
-
-            n_still_per_sample = still_masked.sum(dim=1)
             # Round down so the schedule is back-loaded — fewer tokens unmasked
             # in early (high-uncertainty) steps, more in later steps. E.g. 14
             # tokens over 4 steps -> (3, 3, 4, 4); over 3 steps -> (4, 5, 5).
             # The final step (step == 1) divides by 1, so it always clears the
             # remainder and decoding completes.
-            n_to_unmask = (n_still_per_sample.float() / step).floor().long().clamp(min=1)
+            n_to_unmask = (still_masked.sum(dim=1).float() / step).floor().long().clamp(min=1)
 
-            conf_masked = confidence.clone()
-            conf_masked[~still_masked] = float("-inf")
+            # Unmask the n_to_unmask most confident masked positions: rank them,
+            # then scatter the per-rank decision back to positions.
+            sorted_conf, sorted_idx = confidence.sort(dim=1, descending=True)
+            unmask_sorted = (pos_in_sort < n_to_unmask.unsqueeze(1)) & (sorted_conf > float("-inf"))
+            unmask = torch.zeros_like(still_masked).scatter(1, sorted_idx, unmask_sorted)
+            current_ids = torch.where(unmask, candidates, current_ids)
 
-            _, sorted_idx = conf_masked.sort(dim=1, descending=True)
-            pos_in_sort = torch.arange(blk_sz, device=device).unsqueeze(0)
-            unmask_mask = pos_in_sort < n_to_unmask.unsqueeze(1)
-            unmask_mask = unmask_mask & (conf_masked.gather(1, sorted_idx) > float("-inf"))
-
-            selected_positions = sorted_idx[unmask_mask]
-            batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(sorted_idx)[unmask_mask]
-            new_ids[batch_indices, selected_positions] = candidates[batch_indices, selected_positions]
-
-            current_ids = new_ids
-
-        # Safety net: force-unmask remaining
-        is_free = torch.ones(blk_sz, dtype=torch.bool, device=device)
-        if n_fixed > 0:
-            is_free[:n_fixed] = False
-        still_masked = (current_ids == self.mask_token_id) & is_free[None, :]
-        if still_masked.any():
-            fb_logits = block_logits_fn(current_ids)
-            fb_probs = fb_logits[..., action_slice].softmax(dim=-1)
-            if self.config.expectation_sample:
-                bin_indices = torch.arange(
-                    self.config.n_bins, device=device, dtype=fb_probs.dtype
-                )
-                fallback = (
-                    (fb_probs * bin_indices).sum(dim=-1)
-                    .round().long().clamp(0, self.config.n_bins - 1)
-                    + self.action_bin_start
-                )
-                if self.config.gripper_dims:
-                    argmax_fallback = fb_probs.argmax(dim=-1) + self.action_bin_start
-                    for d in self.config.gripper_dims:
-                        dim_idx = d % self.action_dim
-                        dim_mask = torch.arange(blk_sz, device=device) % self.action_dim == dim_idx
-                        fallback[:, dim_mask] = argmax_fallback[:, dim_mask]
-            else:
-                fallback = fb_probs.argmax(dim=-1) + self.action_bin_start
-            current_ids = torch.where(still_masked, fallback, current_ids)
-
+        # Every free token is unmasked by the last step: with n_steps <= n_free,
+        # at least `step` tokens are still masked going into each step, and
+        # step 1 takes all that remain. Checked on the device (no host sync).
+        torch._assert_async(~((current_ids == self.mask_token_id) & is_free).any())
         return current_ids
 
     def _unmask_confidence(self, action_probs, device):
@@ -1153,231 +1153,205 @@ class Qwen3VLBlockDiffusion(nn.Module):
             position_ids,
         )
 
-    def _forward_block_inference(
+    # Roles of the suffix tokens that follow the shared cached prefix at inference.
+    _EXTRA, _ANCHOR, _NOISY, _CLEAN = 0, 1, 2, 3
+
+    def _init_block_decoding(
         self,
         prefix_kv,
         prefix_cache_len: int,
         per_sample_prefix_end: Tensor,
         position_ids_full: Tensor,
         model_inputs: dict,
+    ) -> dict:
+        """Start decoding a chunk on top of the shared prefix cache.
+
+        Inference uses the *training* layout and mask. Training gives every block
+        two token groups with different attention:
+            noisy_j  -> prefix, noisy_j, clean_{<j}
+            clean_j  -> prefix, anchor, clean_{<=j}, noisy_{j+1}
+            anchor   -> prefix, anchor, noisy_0
+        and block j is predicted at its predictor positions (anchor for j = 0,
+        else clean_{j-1}). Nothing depends on a block later than its own
+        successor, so once block j is decoded the pair
+        (predictor_j, noisy_j := decoded_j) is final and its keys/values can stay
+        in the cache. Every model call therefore carries only the live pair
+        [predictor_n | noisy_n]; the pair finished by the previous block is
+        committed in the same call as the next block's first denoising step.
+
+        The anchor only predicts block 0, so its pair is never committed: later
+        blocks do not attend to it (training lets clean blocks see it), which keeps
+        2 * block_size fewer tokens of KV per sample.
+
+        Cache layout: [prefix | extra-prefix (left-padded per sample)
+                       | (clean_0, noisy_1) | (clean_1, noisy_2) | ... ].
+        Order is irrelevant to attention: visibility comes from the explicit 4D
+        mask, positions from RoPE (clean_j aliases noisy_j's positions, as in
+        training).
+
+        Returns the decoding state consumed by `_forward_block_inference`.
+        """
+        device = model_inputs["input_ids"].device
+        prefix_ends = per_sample_prefix_end.tolist()
+        batch_size = len(prefix_ends)
+        state = {
+            "kv": prefix_kv,
+            "prefix_len": prefix_cache_len,
+            # Last prefix position per sample, (3, B): action positions continue from it.
+            "last_pos": torch.stack(
+                [position_ids_full[:, s, pe - 1] for s, pe in enumerate(prefix_ends)], dim=1
+            ),
+            # Role / block id / validity of the suffix columns already in the cache.
+            "cat": torch.zeros(0, dtype=torch.long, device=device),
+            "bid": torch.zeros(0, dtype=torch.long, device=device),
+            "valid": torch.zeros(batch_size, 0, dtype=torch.bool, device=device),
+            "n_committed": 0,  # blocks whose pair has been settled (committed, or dropped for block 0)
+        }
+
+        # Prefix tokens past the shared cached prefix (prompts differ in length),
+        # left-padded across the batch.
+        max_extra = max(pe - prefix_cache_len for pe in prefix_ends)
+        if max_extra > 0:
+            ids, pos, valid = [], [], []
+            for s, pe in enumerate(prefix_ends):
+                left_pad = max_extra - (pe - prefix_cache_len)
+                extra = model_inputs["input_ids"][s, prefix_cache_len:pe]
+                extra_pos = position_ids_full[:, s, prefix_cache_len:pe]
+                if left_pad > 0:
+                    pad = torch.full((left_pad,), self.pad_token_id, dtype=torch.long, device=device)
+                    extra = torch.cat([pad, extra])
+                    # Dummy positions for the left-pad (masked out)
+                    pad_pos = position_ids_full[:, s, prefix_cache_len:prefix_cache_len + left_pad]
+                    extra_pos = torch.cat([pad_pos, extra_pos], dim=1)
+                ids.append(extra)
+                pos.append(extra_pos)
+                valid.append(torch.arange(max_extra, device=device) >= left_pad)
+            self._forward_suffix_rows(
+                state,
+                torch.stack(ids),
+                torch.stack(pos, dim=1),
+                torch.full((max_extra,), self._EXTRA, dtype=torch.long, device=device),
+                torch.full((max_extra,), -1, dtype=torch.long, device=device),
+                torch.stack(valid),
+                keep=max_extra,
+            )
+        return state
+
+    def _forward_suffix_rows(
+        self, state: dict, ids: Tensor, pos: Tensor, rcat: Tensor, rbid: Tensor, rvalid: Tensor, keep: int
+    ) -> Tensor:
+        """Run rows (role `rcat`, block id `rbid`) against the cache and leave the
+        first `keep` of them in it. Returns logits (B, n_rows, V)."""
+        cx, ca, cn, cc = self._EXTRA, self._ANCHOR, self._NOISY, self._CLEAN
+        kv, prefix_len = state["kv"], state["prefix_len"]
+        device = ids.device
+        batch_size, n_rows = ids.shape
+        kv_len = _get_kv_seq_length(kv)
+
+        ccat = torch.cat([state["cat"], rcat])
+        cbid = torch.cat([state["bid"], rbid])
+        cvalid = torch.cat([state["valid"], rvalid], dim=1)
+        ri, cj = rcat[:, None], ccat[None, :]
+        bi, bj = rbid[:, None], cbid[None, :]
+        n_cached = state["cat"].numel()
+        col_idx = torch.arange(n_cached + n_rows, device=device)[None, :]
+        row_idx = (n_cached + torch.arange(n_rows, device=device))[:, None]
+        # Same allowed-pair table as `_make_block_diffusion_training_mask`
+        # (the extra-prefix tokens are prefix: causal among themselves, visible to all).
+        allowed = (
+            ((ri == cx) & (cj == cx) & (col_idx <= row_idx))
+            | ((ri == ca) & ((cj == cx) | (cj == ca) | ((cj == cn) & (bj == 0))))
+            | ((ri == cn) & ((cj == cx) | ((cj == cn) & (bi == bj)) | ((cj == cc) & (bj < bi))))
+            | ((ri == cc) & ((cj == cx) | (cj == ca) | ((cj == cn) & (bj == bi + 1)) | ((cj == cc) & (bj <= bi))))
+        )
+        allowed = allowed[None] & cvalid[:, None, :] & rvalid[:, :, None]
+        # Left-pad rows would otherwise be masked everywhere (softmax over an all
+        # -inf row is NaN, see the training mask). Let each see itself: nothing
+        # attends to it and its logits are never read.
+        allowed = allowed | ((col_idx == row_idx)[None] & ~rvalid[:, :, None])
+
+        neg = float("-inf")
+        attn = torch.zeros((batch_size, 1, n_rows, kv_len + n_rows), device=device, dtype=self.precision)
+        attn[:, 0, :, :prefix_len] = torch.where(rvalid[:, :, None], 0.0, neg).to(self.precision)
+        attn[:, 0, :, prefix_len:] = torch.where(allowed, 0.0, neg).to(self.precision)
+
+        try:
+            outputs = self.vlm.forward(
+                input_ids=ids,
+                attention_mask=attn,
+                position_ids=pos,
+                past_key_values=kv,
+                cache_position=torch.arange(kv_len, kv_len + n_rows, device=device),
+                use_cache=False,
+            )
+        finally:
+            # DynamicLayer.update() appends to the cache even under use_cache=False:
+            # keep the committed rows (they come first), drop the rest.
+            if hasattr(kv, "layers"):
+                for layer in kv.layers:
+                    if getattr(layer, "is_initialized", False):
+                        layer.crop(kv_len + keep)
+        if keep:
+            state["cat"] = torch.cat([state["cat"], rcat[:keep]])
+            state["bid"] = torch.cat([state["bid"], rbid[:keep]])
+            state["valid"] = torch.cat([state["valid"], rvalid[:, :keep]], dim=1)
+        return outputs.logits
+
+    def _block_pair_rows(self, state: dict, j: int, decoded_blocks: list[Tensor], noisy_tokens: Tensor):
+        """Rows [predictor of block j | noisy_j]: token ids, M-RoPE positions, roles, block ids."""
+        blk_sz = self.block_size
+        device = noisy_tokens.device
+        if j == 0:
+            predictor, role, pred_bid = torch.full_like(noisy_tokens, self.mask_token_id), self._ANCHOR, -1
+        else:
+            predictor, role, pred_bid = decoded_blocks[j - 1], self._CLEAN, j - 1
+
+        def positions(slot):  # slot 0 = anchor, slot b + 1 = block b (noisy and clean alike)
+            offsets = 1 + slot * blk_sz + torch.arange(blk_sz, device=device)
+            return state["last_pos"][:, :, None] + offsets.view(1, 1, -1)
+
+        ids = torch.cat([predictor, noisy_tokens], dim=1)
+        pos = torch.cat([positions(j), positions(j + 1)], dim=2)
+        rcat = torch.cat([
+            torch.full((blk_sz,), role, dtype=torch.long, device=device),
+            torch.full((blk_sz,), self._NOISY, dtype=torch.long, device=device),
+        ])
+        rbid = torch.cat([
+            torch.full((blk_sz,), pred_bid, dtype=torch.long, device=device),
+            torch.full((blk_sz,), j, dtype=torch.long, device=device),
+        ])
+        return ids, pos, rcat, rbid
+
+    def _forward_block_inference(
+        self,
+        state: dict,
         decoded_blocks: list[Tensor],
         current_noisy_ids: Tensor,
     ) -> Tensor:
         """
-        Forward pass for decoding a single block during inference using KV cache.
+        Forward pass for one denoising step of block n = len(decoded_blocks).
 
-        With the anchor variant, the suffix sent after the KV cache is:
-            [extra_prefix_tokens | anchor | decoded_0..b-1 | noisy_b]
-
-        The anchor is always block_size MASK tokens. It serves as the
-        predictor for block 0 (consistent with later blocks using decoded
-        blocks as predictors).
-
-        extra_prefix_tokens: any prefix tokens between prefix_cache_len and
-        per_sample_prefix_end (due to variable task text lengths). These are
-        left-padded across the batch.
+        Sends [pairs of finished blocks not yet in the cache | predictor_n | noisy_n]
+        after the KV cache (see `_init_block_decoding`); the finished pairs stay
+        in the cache, the live pair is dropped again. Block 0's pair (the anchor)
+        is never committed.
 
         Returns predictor logits: (B, block_size, V).
         """
-        # DynamicLayer.update() appends to the cache even under use_cache=False,
-        # so the prefix KV would grow across blocks. Snapshot each layer's
-        # seq_len here and crop back after the forward to reuse the prefix
-        # unchanged (cheaper than deep-copying the cache per block).
-        pre_layer_lens = (
-            [l.get_seq_length() for l in prefix_kv.layers]
-            if hasattr(prefix_kv, "layers") else None
-        )
-
-        device = current_noisy_ids.device
-        batch_size = current_noisy_ids.shape[0]
         blk_sz = self.block_size
-        n_decoded = len(decoded_blocks)
-        input_ids_full = model_inputs["input_ids"]
-
-        # Extra prefix: tokens between prefix_cache_len and per_sample_prefix_end
-        extra_lens = per_sample_prefix_end - prefix_cache_len  # (B,)
-        max_extra = extra_lens.max().item()
-
-        # Anchor: always fully masked
-        anchor_ids = torch.full(
-            (batch_size, blk_sz),
-            fill_value=self.mask_token_id,
-            dtype=torch.long,
-            device=device,
-        )
-
-        # Build per-sample suffix: [extra_prefix | anchor | decoded_0..b-1 | noisy_b]
-        suffix_parts = []
-        for s in range(batch_size):
-            pe = per_sample_prefix_end[s].item()
-            extra_len = pe - prefix_cache_len
-
-            # Extra prefix tokens (left-padded to max_extra)
-            extra_ids = input_ids_full[s, prefix_cache_len:pe]
-            if extra_len < max_extra:
-                pad = torch.full(
-                    (max_extra - extra_len,),
-                    self.pad_token_id, dtype=torch.long, device=device,
-                )
-                extra_ids = torch.cat([pad, extra_ids])
-
-            parts = [extra_ids, anchor_ids[s]]
-            for db in decoded_blocks:
-                parts.append(db[s])
-            parts.append(current_noisy_ids[s])
-
-            suffix_parts.append(torch.cat(parts))
-
-        combined = torch.stack(suffix_parts)  # (B, combined_len)
-        combined_len = combined.shape[1]
-
-        # Cache position: sequential from prefix_cache_len
-        cache_position = torch.arange(
-            prefix_cache_len, prefix_cache_len + combined_len, device=device,
-        )
-
-        # ── Position IDs ──
-        position_ids_list = []
-        for s in range(batch_size):
-            pe = per_sample_prefix_end[s].item()
-            extra_len = pe - prefix_cache_len
-            left_pad = max_extra - extra_len
-
-            # Extra prefix positions
-            extra_pos = position_ids_full[:, s, prefix_cache_len:pe]  # (3, extra_len)
-            if extra_len < max_extra:
-                # Use dummy positions for left-pad (will be masked out)
-                pad_pos = position_ids_full[:, s, prefix_cache_len:prefix_cache_len + left_pad]
-                extra_pos = torch.cat([pad_pos, extra_pos], dim=1)
-
-            # Anchor + action blocks: continue sequentially from last prefix position
-            last_prefix_pos = position_ids_full[:, s, pe - 1:pe]  # (3, 1)
-            n_action_positions = blk_sz + n_decoded * blk_sz + blk_sz  # anchor + decoded + noisy
-            action_offsets = torch.arange(1, 1 + n_action_positions, device=device)
-            action_pos = last_prefix_pos + action_offsets.view(1, -1)  # (3, n_action_positions)
-
-            sample_pos = torch.cat([extra_pos, action_pos], dim=1)
-            position_ids_list.append(sample_pos)
-
-        position_ids = torch.stack(position_ids_list, dim=1)  # (3, B, combined_len)
-
-        # ── Attention mask ──
-        kv_len = _get_kv_seq_length(prefix_kv)
-        attn = torch.zeros(
-            (batch_size, 1, combined_len, kv_len + combined_len),
-            device=device,
-            dtype=self.precision,
-        )
-
-        # Column/row layout within combined:
-        #   [0..max_extra-1]  = extra prefix
-        #   [max_extra..max_extra+blk_sz-1] = anchor
-        #   [max_extra+blk_sz..max_extra+blk_sz+n_decoded*blk_sz-1] = decoded blocks
-        #   [max_extra+blk_sz+n_decoded*blk_sz..combined_len-1] = noisy block
-
-        anchor_row_start = max_extra
-        anchor_row_end = max_extra + blk_sz
-        anchor_col_start = kv_len + max_extra
-        anchor_col_end = kv_len + max_extra + blk_sz
-
-        def _block_row(i):
-            start = max_extra + blk_sz + i * blk_sz
-            return start, start + blk_sz
-
-        def _block_col(i):
-            start = kv_len + max_extra + blk_sz + i * blk_sz
-            return start, start + blk_sz
-
-        noisy_row_start = max_extra + blk_sz + n_decoded * blk_sz
-        noisy_row_end = combined_len
-        noisy_col_start = kv_len + max_extra + blk_sz + n_decoded * blk_sz
-        noisy_col_end = kv_len + combined_len
-
-        for s in range(batch_size):
-            extra_len = (per_sample_prefix_end[s] - prefix_cache_len).item()
-            left_pad = max_extra - extra_len
-
-            # ── Mask out left-padded extra prefix positions ──
-            if left_pad > 0:
-                attn[s, 0, :left_pad, :] = float("-inf")
-                attn[s, 0, :, kv_len:kv_len + left_pad] = float("-inf")
-
-            # ── Extra prefix: causal within itself, sees KV cache ──
-            for i in range(left_pad, max_extra):
-                # Block everything after this token in extra prefix, and all action tokens
-                attn[s, 0, i, kv_len + i + 1:kv_len + max_extra] = float("-inf")
-                attn[s, 0, i, anchor_col_start:] = float("-inf")
-
-            # ── Anchor: sees KV cache + extra prefix, bidirectional within itself ──
-            # Already 0.0 for KV cache and extra prefix
-            # Already 0.0 within anchor (anchor_col_start..anchor_col_end)
-            #
-            # Training gives the anchor exactly one edge into the action region:
-            # anchor → noisy block 0. Once block 0 has been decoded its token
-            # group at those RoPE positions is `decoded_0` — a mask-ratio-0
-            # sample from the same corruption distribution — so that is where the
-            # edge has to point. The block currently being decoded is block
-            # n_decoded, not block 0, so for n_decoded > 0 the anchor must NOT
-            # see it: every decoded block attends to the anchor, so contaminating
-            # it does reach the predictor.
-            for i in range(n_decoded):
-                if i == 0:
-                    continue  # anchor → decoded_0 stands in for anchor → noisy_0
-                cs, ce = _block_col(i)
-                attn[s, 0, anchor_row_start:anchor_row_end, cs:ce] = float("-inf")
-            if n_decoded > 0:
-                attn[s, 0, anchor_row_start:anchor_row_end, noisy_col_start:noisy_col_end] = float("-inf")
-
-            # ── Decoded blocks (they play the role of training's clean blocks) ──
-            for i in range(n_decoded):
-                rs, re = _block_row(i)
-
-                # Sees KV cache + extra prefix + anchor (already 0.0)
-                # Bidirectional within itself (already 0.0)
-
-                # Training: clean block i attends to clean blocks 0..i AND to
-                # noisy block i+1. At inference block i+1's token group is
-                # `decoded_{i+1}`, so leave that one open and block i+2 onwards.
-                for j in range(i + 2, n_decoded):
-                    cs, ce = _block_col(j)
-                    attn[s, 0, rs:re, cs:ce] = float("-inf")
-
-                # Last decoded block sees noisy block (clean→noisy next pattern)
-                # Other decoded blocks don't see noisy
-                if i < n_decoded - 1:
-                    attn[s, 0, rs:re, noisy_col_start:noisy_col_end] = float("-inf")
-
-            # ── Noisy block ──
-            # Sees KV cache + extra prefix (already 0.0)
-            # Sees prior decoded blocks (already 0.0)
-            # Bidirectional within itself (already 0.0)
-            # Training does NOT give noisy blocks an edge to the anchor
-            # (`_make_block_diffusion_training_mask` has no `is_noi_i & is_sen_j`
-            # term), so cut it here too.
-            attn[s, 0, noisy_row_start:noisy_row_end, anchor_col_start:anchor_col_end] = float("-inf")
-
-        try:
-            outputs = self.vlm.forward(
-                input_ids=combined,
-                attention_mask=attn,
-                position_ids=position_ids,
-                past_key_values=prefix_kv,
-                cache_position=cache_position,
-                use_cache=False,
-            )
-        finally:
-            if pre_layer_lens is not None:
-                for layer, n in zip(prefix_kv.layers, pre_layer_lens):
-                    if n > 0 and getattr(layer, "is_initialized", False):
-                        layer.crop(n)
-
-        logits = outputs.logits.float()
-
-        # Predictor logits: anchor for block 0, last decoded for block b>0
-        if n_decoded == 0:
-            return logits[:, anchor_row_start:anchor_row_end, :]
-        pred_start = max_extra + blk_sz + (n_decoded - 1) * blk_sz
-        return logits[:, pred_start:pred_start + blk_sz, :]
+        n = len(decoded_blocks)
+        pending = range(max(state["n_committed"], 1), n)
+        parts = [self._block_pair_rows(state, j, decoded_blocks, decoded_blocks[j]) for j in pending]
+        parts.append(self._block_pair_rows(state, n, decoded_blocks, current_noisy_ids))
+        ids = torch.cat([p[0] for p in parts], dim=1)
+        pos = torch.cat([p[1] for p in parts], dim=2)
+        rcat = torch.cat([p[2] for p in parts])
+        rbid = torch.cat([p[3] for p in parts])
+        rvalid = torch.ones(ids.shape, dtype=torch.bool, device=ids.device)
+        keep = 2 * blk_sz * len(pending)
+        logits = self._forward_suffix_rows(state, ids, pos, rcat, rbid, rvalid, keep)
+        state["n_committed"] = n
+        return logits[:, keep:keep + blk_sz].float()
 
     @torch.no_grad()
     def generate_actions(self, batch, n_steps=2, prev_decoded_blocks=None):
@@ -1465,15 +1439,18 @@ class Qwen3VLBlockDiffusion(nn.Module):
                     ]
 
         decoded_blocks = []
+        decode_state = self._init_block_decoding(
+            prefix_kv,
+            prefix_cache_len,
+            per_sample_prefix_end,
+            position_ids_full,
+            model_inputs,
+        )
 
-        def _make_logits_fn(decoded_so_far):
-            return lambda noisy_ids: self._forward_block_inference(
-                prefix_kv=prefix_kv,
-                prefix_cache_len=prefix_cache_len,
-                per_sample_prefix_end=per_sample_prefix_end,
-                position_ids_full=position_ids_full,
-                model_inputs=model_inputs,
-                decoded_blocks=decoded_so_far,
+        def _block_logits_fn(noisy_ids):
+            return self._forward_block_inference(
+                state=decode_state,
+                decoded_blocks=decoded_blocks,
                 current_noisy_ids=noisy_ids,
             )
 
@@ -1524,11 +1501,11 @@ class Qwen3VLBlockDiffusion(nn.Module):
         n_blocks_needed = min(n_blocks_needed, self.n_blocks)
 
         # ── Decode blocks ──
+        # In-painted blocks need no model call; their pair enters the cache with
+        # the next block that does.
         for blk_idx in range(n_blocks_needed):
-            _decoded_so_far = [db.clone() for db in decoded_blocks]
-            logits_fn = _make_logits_fn(_decoded_so_far)
             block_result = _denoise_or_inpaint(
-                blk_idx=blk_idx, block_logits_fn=logits_fn,
+                blk_idx=blk_idx, block_logits_fn=_block_logits_fn,
             )
             decoded_blocks.append(block_result)
 
