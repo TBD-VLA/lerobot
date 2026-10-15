@@ -233,8 +233,9 @@ class Qwen3VLBlockDiffusion(nn.Module):
                   sees noisy block 0 (like clean→noisy next block)
       - Noisy block b: sees prefix, clean blocks 0..b-1,
                        bidirectional within self
-      - Clean block b: sees prefix, anchor, clean blocks 0..b-1,
-                       bidirectional within self, noisy block b+1
+      - Clean block b: sees prefix, anchor (unless
+                       `clean_blocks_attend_anchor` is False), clean blocks
+                       0..b-1, bidirectional within self, noisy block b+1
     """
 
     def __init__(self, config: TBDVLAConfig):
@@ -685,6 +686,7 @@ class Qwen3VLBlockDiffusion(nn.Module):
 
         The anchor block acts as "clean block -1": sees prefix, bidirectional
         within itself, sees noisy block 0 (clean→noisy next-block pattern).
+        Clean blocks see the anchor unless `clean_blocks_attend_anchor` is False.
 
         Returns additive mask (BS, 1, L, L) with 0 for allowed, -inf for blocked.
         """
@@ -739,7 +741,7 @@ class Qwen3VLBlockDiffusion(nn.Module):
             | (is_noi_i & is_noi_j & (blk_i == blk_j))
             | (is_noi_i & is_cln_j & (blk_i > blk_j))
             | (is_cln_i & is_pre_j)
-            | (is_cln_i & is_sen_j)
+            | (is_cln_i & is_sen_j & self.config.clean_blocks_attend_anchor)
             | (is_cln_i & is_noi_j & (blk_i + 1 == blk_j))
             | (is_cln_i & is_cln_j & (blk_i >= blk_j))
             | (is_suf_i & causal)
@@ -1214,8 +1216,9 @@ class Qwen3VLBlockDiffusion(nn.Module):
         committed in the same call as the next block's first denoising step.
 
         The anchor only predicts block 0, so its pair is never committed: later
-        blocks do not attend to it (training lets clean blocks see it), which keeps
-        2 * block_size fewer tokens of KV per sample.
+        blocks do not attend to it, as in training with
+        `clean_blocks_attend_anchor=False` (by default training lets clean blocks
+        see it). This keeps 2 * block_size fewer tokens of KV per sample.
 
         Cache layout: [prefix | extra-prefix (left-padded per sample)
                        | (clean_0, noisy_1) | (clean_1, noisy_2) | ... ].
@@ -1295,7 +1298,15 @@ class Qwen3VLBlockDiffusion(nn.Module):
             ((ri == cx) & (cj == cx) & (col_idx <= row_idx))
             | ((ri == ca) & ((cj == cx) | (cj == ca) | ((cj == cn) & (bj == 0))))
             | ((ri == cn) & ((cj == cx) | ((cj == cn) & (bi == bj)) | ((cj == cc) & (bj < bi))))
-            | ((ri == cc) & ((cj == cx) | (cj == ca) | ((cj == cn) & (bj == bi + 1)) | ((cj == cc) & (bj <= bi))))
+            | (
+                (ri == cc)
+                & (
+                    (cj == cx)
+                    | ((cj == ca) & self.config.clean_blocks_attend_anchor)
+                    | ((cj == cn) & (bj == bi + 1))
+                    | ((cj == cc) & (bj <= bi))
+                )
+            )
         )
         allowed = allowed[None] & cvalid[:, None, :] & rvalid[:, :, None]
         # Left-pad rows would otherwise be masked everywhere (softmax over an all

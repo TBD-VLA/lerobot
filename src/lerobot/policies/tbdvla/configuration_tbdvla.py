@@ -48,6 +48,10 @@ class TBDVLAConfig(PreTrainedConfig):
     use_prefix_prediction_loss: bool = False
     # Keep the Qwen3-VL vision tower frozen during training (no gradients).
     freeze_vision_encoder: bool = False
+    # Training mask: let the clean blocks (the predictors of blocks 1..B-1)
+    # attend to the anchor. Inference drops the anchor once block 0 is decoded;
+    # False trains with that same visibility.
+    clean_blocks_attend_anchor: bool = True
 
     # Inference hyperparameters
     block_temporal_size: int = 4  # number of temporal steps per block

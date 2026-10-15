@@ -134,6 +134,7 @@ of each new prompt-length bucket captures its graphs; `--policy.cuda_graphs=fals
 | `--policy.gradient_checkpointing` | Enable gradient checkpointing (saves VRAM) | false |
 | `--policy.precision` | Training precision (`float16`, `bfloat16`, `float32`) | `bfloat16` |
 | `--policy.attn_implementation` | Attention backend (`eager`, `sdpa`, `flex_attention`) | `sdpa` |
+| `--policy.clean_blocks_attend_anchor` | Let clean blocks attend to the anchor block in the training mask. Inference drops the anchor after block 0; `false` trains with the same visibility | true |
 | `--policy.optimizer_lr` | AdamW learning rate (applied to all parameters) | 1e-4 |
 | `--policy.optimizer_betas` | Adam betas | (0.95, 0.999) |
 | `--policy.optimizer_weight_decay` | Weight decay | 0.01 |
