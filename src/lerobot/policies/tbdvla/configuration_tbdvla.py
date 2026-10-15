@@ -55,6 +55,12 @@ class TBDVLAConfig(PreTrainedConfig):
     expectation_sample: bool = True
     gripper_dims: tuple | None = (-1,) # specicy when using sticky grippers
     latency_timestep: int = 0  # number of timesteps to inpaint (freeze) from the previous chunk's tail
+    # At inference on CUDA, replay the prefix and block-step model calls from
+    # captured CUDA graphs over a static KV cache (see cuda_graphs.py). None: on
+    # whenever `compile_model` is; True / False force it on / off. Each new
+    # (batch size, prompt-length bucket) is captured once; inputs with camera
+    # views of different sizes use the regular path.
+    cuda_graphs: bool | None = None
 
     # Image parameters. Incoming images are resized to `image_resolution`
     # (skipped if already at that size) and then cropped to `crop_shape`.

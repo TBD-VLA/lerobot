@@ -94,6 +94,10 @@ uv run python src/lerobot/scripts/lerobot_eval.py \
   --policy.n_diffusion_steps=2  
 ```
 
+With `--policy.compile_model=true`, inference on CUDA also replays the prefix and block-step model calls from captured
+CUDA graphs over a static KV cache (`--policy.cuda_graphs`, on by default together with `compile_model`). The first chunk
+of each new prompt-length bucket captures its graphs; `--policy.cuda_graphs=false` turns this off.
+
 ### VLA Checkpoints 🤗
 
 #### [sean1295/tbdvla_libero](https://huggingface.co/sean1295/tbdvla_libero)
