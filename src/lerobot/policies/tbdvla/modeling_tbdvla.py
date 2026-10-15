@@ -231,10 +231,10 @@ class Qwen3VLBlockDiffusion(nn.Module):
     Attention:
       - Anchor: sees prefix (causally), bidirectional within self,
                   sees noisy block 0 (like clean→noisy next block)
-      - Noisy block b: sees prefix, anchor, clean blocks 0..b-1,
+      - Noisy block b: sees prefix, clean blocks 0..b-1,
                        bidirectional within self
       - Clean block b: sees prefix, anchor, clean blocks 0..b-1,
-                       bidirectional within self
+                       bidirectional within self, noisy block b+1
     """
 
     def __init__(self, config: TBDVLAConfig):
