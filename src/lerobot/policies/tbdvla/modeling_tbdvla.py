@@ -598,7 +598,16 @@ class Qwen3VLBlockDiffusion(nn.Module):
             assert (slot_counts == n_slots).all(), (
                 f"Expected {n_slots} ACT_SLOT tokens, got {slot_counts.tolist()}"
             )
+            grid = None
+            if not self.training:  # image grids known on the CPU, for the CUDA-graph path
+                grid = tuple(tuple(int(x) for x in row) for row in image_inputs["image_grid_thw"].tolist())
+                merge = self.vlm.model.visual.spatial_merge_size
+                n_image_tokens = int((input_ids == self.vlm.config.image_token_id).sum())
+                assert n_image_tokens == sum(t * h * w for t, h, w in grid) // merge**2, (
+                    f"{n_image_tokens} image tokens for image grids {grid}"
+                )
             layout = {
+                "grid": grid,  # (t, h, w) per image, on the CPU
                 "text": {k: (v.to(device) if isinstance(v, Tensor) else v) for k, v in text_inputs.items()},
                 "slot_positions": slot_mask.nonzero()[:, 1].reshape(batch_size, n_slots).to(device),
                 "state_positions": (
@@ -1077,6 +1086,26 @@ class Qwen3VLBlockDiffusion(nn.Module):
         torch._assert_async(~((current_ids == self.mask_token_id) & is_free).any())
         return current_ids
 
+    def _graph_decoder_for(self, model_inputs: dict):
+        """The CUDA-graph decoder if `config.cuda_graphs` applies to these inputs, else None."""
+        layout = model_inputs.get("layout")
+        enabled = self.config.cuda_graphs
+        if enabled is None:
+            enabled = self.config.compile_model
+        if (
+            not enabled
+            or self.training
+            or layout is None
+            or model_inputs["input_ids"].device.type != "cuda"
+            or len(set(layout["grid"])) != 1  # the captured vision path needs equal-size views
+        ):
+            return None
+        if getattr(self, "_graph_decoder", None) is None:
+            from lerobot.policies.tbdvla.cuda_graphs import CudaGraphDecoder
+
+            self._graph_decoder = CudaGraphDecoder(self)
+        return self._graph_decoder
+
     def _unmask_confidence(self, action_probs, device):
         """Confidence score for unmasking order."""
         return action_probs.max(dim=-1).values
@@ -1123,6 +1152,12 @@ class Qwen3VLBlockDiffusion(nn.Module):
             min_safe_prefix = last_image_pad_per_sample.max().item()
             prefix_cache_len = max(prefix_cache_len, min_safe_prefix)
 
+        position_ids = self._get_position_ids_from_inputs(model_inputs, batch_size)
+        graph_decoder = self._graph_decoder_for(model_inputs)
+        if graph_decoder is not None:
+            prefix_kv = graph_decoder.prefix(model_inputs, prefix_cache_len, position_ids)
+            return prefix_kv, prefix_cache_len, per_sample_prefix_end, model_inputs, slot_positions, position_ids
+
         # Standard causal mask for the prefix
         causal_4d = torch.tril(torch.ones(prefix_cache_len, prefix_cache_len, device=device))
         causal_4d_mask = causal_4d.masked_fill(causal_4d == 0, float("-inf"))
@@ -1131,7 +1166,6 @@ class Qwen3VLBlockDiffusion(nn.Module):
             batch_size, 1, -1, -1
         ).to(self.precision)
 
-        position_ids = self._get_position_ids_from_inputs(model_inputs, batch_size)
         prefix_position_ids = position_ids[:, :, :prefix_cache_len]
 
         outputs = self.vlm.forward(
@@ -1246,7 +1280,6 @@ class Qwen3VLBlockDiffusion(nn.Module):
         kv, prefix_len = state["kv"], state["prefix_len"]
         device = ids.device
         batch_size, n_rows = ids.shape
-        kv_len = _get_kv_seq_length(kv)
 
         ccat = torch.cat([state["cat"], rcat])
         cbid = torch.cat([state["bid"], rbid])
@@ -1270,6 +1303,15 @@ class Qwen3VLBlockDiffusion(nn.Module):
         # attends to it and its logits are never read.
         allowed = allowed | ((col_idx == row_idx)[None] & ~rvalid[:, :, None])
 
+        if getattr(kv, "graph_runner", None) is not None:  # static cache of the CUDA-graph path
+            logits = self._graph_decoder.suffix_rows(state, ids, pos, allowed, rvalid)
+            if keep:
+                state["cat"] = torch.cat([state["cat"], rcat[:keep]])
+                state["bid"] = torch.cat([state["bid"], rbid[:keep]])
+                state["valid"] = torch.cat([state["valid"], rvalid[:, :keep]], dim=1)
+            return logits
+
+        kv_len = _get_kv_seq_length(kv)
         neg = float("-inf")
         attn = torch.zeros((batch_size, 1, n_rows, kv_len + n_rows), device=device, dtype=self.precision)
         attn[:, 0, :, :prefix_len] = torch.where(rvalid[:, :, None], 0.0, neg).to(self.precision)
