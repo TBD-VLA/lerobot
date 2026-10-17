@@ -284,7 +284,9 @@ class CudaGraphDecoder:
         else:
             self.forward = raw_forward
         blk = model.block_size
-        self.n_rows = 4 * blk  # commit pair + live pair
+        # Rows of one call: the live pair and the finished pairs it commits (one, or k - 1 after k in-painted blocks).
+        n_inpainted = model.config.latency_timestep // model.config.block_temporal_size
+        self.n_rows = 2 * blk * max(2, n_inpainted)
         # Room past the prompt: per-sample prompt-length differences (task text is capped at max_task_tokens),
         # committed clean blocks 0..n_blocks-2, and one call's rows.
         self.max_extra = model.config.max_task_tokens or 64
