@@ -1210,17 +1210,18 @@ class Qwen3VLBlockDiffusion(nn.Module):
         and block j is predicted at its predictor positions (anchor for j = 0,
         else clean_{j-1}). Nothing depends on a block later than its own
         successor, so once block j is decoded the pair
-        (predictor_j, noisy_j := decoded_j) is final and its keys/values can stay
-        in the cache. Every model call therefore carries only the live pair
-        [predictor_n | noisy_n]; the pair finished by the previous block is
-        committed in the same call as the next block's first denoising step.
+        (predictor_j, noisy_j := decoded_j) is final. Later blocks attend only to
+        the predictor (clean_{j-1}), so its keys/values stay in the cache, while
+        noisy_j is needed only as its context in the call that commits it. Every
+        model call therefore carries only the live pair [predictor_n | noisy_n];
+        the pair finished by the previous block is committed in the same call as
+        the next block's first denoising step.
 
         The anchor only predicts block 0 and no other block attends to it, so its
-        pair is never committed, which keeps 2 * block_size fewer tokens of KV per
-        sample.
+        pair is never committed.
 
         Cache layout: [prefix | extra-prefix (left-padded per sample)
-                       | (clean_0, noisy_1) | (clean_1, noisy_2) | ... ].
+                       | clean_0 | clean_1 | ... ].
         Order is irrelevant to attention: visibility comes from the explicit 4D
         mask, positions from RoPE (clean_j aliases noisy_j's positions, as in
         training).
@@ -1375,27 +1376,30 @@ class Qwen3VLBlockDiffusion(nn.Module):
         """
         Forward pass for one denoising step of block n = len(decoded_blocks).
 
-        Sends [pairs of finished blocks not yet in the cache | predictor_n | noisy_n]
-        after the KV cache (see `_init_block_decoding`); the finished pairs stay
-        in the cache, the live pair is dropped again. Block 0's pair (the anchor)
-        is never committed.
+        Sends [predictors of finished pairs not yet in the cache | their noisy
+        blocks | predictor_n | noisy_n] after the KV cache (see
+        `_init_block_decoding`); the finished predictors stay in the cache, the
+        rest is dropped again. Block 0's pair (the anchor) is never committed.
 
         Returns predictor logits: (B, block_size, V).
         """
         blk_sz = self.block_size
         n = len(decoded_blocks)
         pending = range(max(state["n_committed"], 1), n)
-        parts = [self._block_pair_rows(state, j, decoded_blocks, decoded_blocks[j]) for j in pending]
+        pairs = [self._block_pair_rows(state, j, decoded_blocks, decoded_blocks[j]) for j in pending]
+        # Predictor halves first: they are what stays in the cache.
+        parts = [tuple(t[..., :blk_sz] for t in p) for p in pairs]
+        parts += [tuple(t[..., blk_sz:] for t in p) for p in pairs]
         parts.append(self._block_pair_rows(state, n, decoded_blocks, current_noisy_ids))
         ids = torch.cat([p[0] for p in parts], dim=1)
         pos = torch.cat([p[1] for p in parts], dim=2)
         rcat = torch.cat([p[2] for p in parts])
         rbid = torch.cat([p[3] for p in parts])
         rvalid = torch.ones(ids.shape, dtype=torch.bool, device=ids.device)
-        keep = 2 * blk_sz * len(pending)
+        keep = blk_sz * len(pending)  # the finished predictors; the live predictor follows their noisy blocks
         logits = self._forward_suffix_rows(state, ids, pos, rcat, rbid, rvalid, keep)
         state["n_committed"] = n
-        return logits[:, keep:keep + blk_sz].float()
+        return logits[:, 2 * keep:2 * keep + blk_sz].float()
 
     @torch.no_grad()
     def generate_actions(self, batch, n_steps=2, prev_decoded_blocks=None):
@@ -1545,8 +1549,8 @@ class Qwen3VLBlockDiffusion(nn.Module):
         n_blocks_needed = min(n_blocks_needed, self.n_blocks)
 
         # ── Decode blocks ──
-        # In-painted blocks need no model call; their pair enters the cache with
-        # the next block that does.
+        # In-painted blocks need no model call; their pair is committed with the
+        # next block that does.
         for blk_idx in range(n_blocks_needed):
             block_result = _denoise_or_inpaint(
                 blk_idx=blk_idx, block_logits_fn=_block_logits_fn,
