@@ -286,9 +286,9 @@ class CudaGraphDecoder:
         blk = model.block_size
         self.n_rows = 4 * blk  # commit pair + live pair
         # Room past the prompt: per-sample prompt-length differences (task text is capped at max_task_tokens),
-        # committed pairs of blocks 1..n_blocks-1, and one call's rows.
+        # committed clean blocks 0..n_blocks-2, and one call's rows.
         self.max_extra = model.config.max_task_tokens or 64
-        self.suffix_len = self.max_extra + 2 * blk * (model.n_blocks - 1) + self.n_rows
+        self.suffix_len = self.max_extra + blk * (model.n_blocks - 1) + self.n_rows
         self.runners: dict[tuple, _GraphRunner] = {}
 
     def runner(self, batch_size: int, prompt_len: int) -> _GraphRunner:

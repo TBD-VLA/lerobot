@@ -186,9 +186,9 @@ def test_denoise_block_matches_reference(expectation_sample, gripper_dims, n_ste
     assert not (new == MASK_ID).any()
 
 
-@skip_if_package_missing("transformers")
-def test_block_commit_schedule_drops_anchor():
-    """Block 0's (anchor) pair is never committed; pair j >= 1 is committed once, in block j+1's first call."""
+def _commit_stub():
+    """Stub whose model call records (roles, block ids, keep), commits like the real cache and returns logits
+    tagged with each row's (role, block id)."""
     from lerobot.policies.tbdvla.modeling_tbdvla import Qwen3VLBlockDiffusion as M
 
     stub = SimpleNamespace(
@@ -207,7 +207,9 @@ def test_block_commit_schedule_drops_anchor():
         if keep:
             state["cat"] = torch.cat([state["cat"], rcat[:keep]])
             state["bid"] = torch.cat([state["bid"], rbid[:keep]])
-        return torch.zeros(ids.shape[0], ids.shape[1], VOCAB)
+        logits = torch.zeros(ids.shape[0], ids.shape[1], VOCAB)
+        logits[..., 0], logits[..., 1] = rcat.float(), rbid.float()  # tag each row's logits with its role / block
+        return logits
 
     stub._forward_suffix_rows = fake_suffix_rows
     state = {
@@ -216,17 +218,46 @@ def test_block_commit_schedule_drops_anchor():
         "cat": torch.zeros(0, dtype=torch.long),
         "bid": torch.zeros(0, dtype=torch.long),
     }
+    return M, stub, state, seen
+
+
+def _rows(*groups):
+    """Expected (roles, block ids) for groups of (role, block id), one block each."""
+    return [r for r, _ in groups for _ in range(BLOCK)], [b for _, b in groups for _ in range(BLOCK)]
+
+
+@skip_if_package_missing("transformers")
+def test_block_commit_schedule_drops_anchor():
+    """Block 0's (anchor) pair is never committed. For j >= 1, block j+1's first call commits clean_{j-1} only:
+    noisy_j is sent as its context and dropped (nothing later attends to it)."""
+    cls, stub, state, seen = _commit_stub()
+    c, n, a = cls._CLEAN, cls._NOISY, cls._ANCHOR
     decoded = []
-    for _ in range(4):  # 4 blocks x 2 denoising steps
+    for blk in range(4):  # 4 blocks x 2 denoising steps
         for _ in range(2):
-            M._forward_block_inference(stub, state, decoded, torch.full((1, BLOCK), MASK_ID))
+            out = cls._forward_block_inference(stub, state, decoded, torch.full((1, BLOCK), MASK_ID))
+            # The returned logits are the live predictor's: the anchor for block 0, else clean_{blk-1}.
+            assert (out[..., 0] == (a if blk == 0 else c)).all() and (out[..., 1] == blk - 1).all()
         decoded.append(torch.full((1, BLOCK), BIN_START))
 
     keeps = [k for _, _, k in seen]
-    assert keeps == [0, 0, 0, 0, 2 * BLOCK, 0, 2 * BLOCK, 0]
-    assert M._ANCHOR not in state["cat"].tolist()  # the anchor never enters the cache
+    assert keeps == [0, 0, 0, 0, BLOCK, 0, BLOCK, 0]
+    assert seen[0][:2] == _rows((a, -1), (n, 0))
+    assert seen[2][:2] == _rows((c, 0), (n, 1))
+    assert seen[4][:2] == _rows((c, 0), (n, 1), (c, 1), (n, 2))
+    assert seen[6][:2] == _rows((c, 1), (n, 2), (c, 2), (n, 3))
     committed = list(zip(state["cat"].tolist(), state["bid"].tolist(), strict=True))
-    expected = []
-    for j in (1, 2):  # (clean_{j-1}, noisy_j) pairs
-        expected += [(M._CLEAN, j - 1)] * BLOCK + [(M._NOISY, j)] * BLOCK
-    assert committed == expected
+    assert committed == [(c, 0)] * BLOCK + [(c, 1)] * BLOCK  # only clean blocks, never the anchor
+
+
+@skip_if_package_missing("transformers")
+def test_commit_after_inpainted_blocks():
+    """Several finished pairs in one call (in-painted blocks 0..2): their clean halves come first and are kept."""
+    cls, stub, state, seen = _commit_stub()
+    decoded = [torch.full((1, BLOCK), BIN_START) for _ in range(3)]
+    out = cls._forward_block_inference(stub, state, decoded, torch.full((1, BLOCK), MASK_ID))
+    c, n = cls._CLEAN, cls._NOISY
+    assert (out[..., 0] == c).all() and (out[..., 1] == 2).all()  # the live predictor clean_2
+    assert seen[0] == (*_rows((c, 0), (c, 1), (n, 1), (n, 2), (c, 2), (n, 3)), 2 * BLOCK)
+    committed = list(zip(state["cat"].tolist(), state["bid"].tolist(), strict=True))
+    assert committed == [(c, 0)] * BLOCK + [(c, 1)] * BLOCK
